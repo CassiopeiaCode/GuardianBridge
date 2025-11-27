@@ -322,17 +322,18 @@ response = client.chat.completions.create(
     "from": "auto",
     "to": "claude_chat",
     "stream": "auto",
-    "strict_parse": false
+    "strict_parse": false,
+    "disable_tools": false
   }
 }
 ```
 
 **参数说明**：
 - [`from`](ai_proxy/proxy/router.py:134): 源格式
-  - `"auto"`: 自动检测所有支持的格式
+  - `"auto"`: 自动检测所有支持的格式（`openai_chat`, `claude_chat`, `claude_code`, `openai_codex`）
   - `"openai_chat"`: 仅识别 OpenAI Chat 格式
   - `["openai_chat", "claude_chat"]`: 识别列表中的任意格式
-- [`to`](ai_proxy/proxy/router.py:184): 目标格式（`openai_chat` / `claude_chat`）
+- [`to`](ai_proxy/proxy/router.py:184): 目标格式（`openai_chat` / `claude_chat` / `claude_code` / `openai_codex`）
 - [`stream`](ai_proxy/transform/formats/parser.py:1): 流式策略
   - `"auto"`: 保持原请求的流式设置
   - `"force_stream"`: 强制使用流式
@@ -340,6 +341,54 @@ response = client.chat.completions.create(
 - [`strict_parse`](ai_proxy/proxy/router.py:135): 严格解析模式
   - `false`: 无法解析时透传原始请求
   - `true`: 无法解析时返回错误
+- `disable_tools`: 禁用工具调用（新增）
+  - `false`: 允许工具调用（默认）
+  - `true`: 禁用工具调用，拒绝包含工具的请求
+
+#### 禁用工具调用配置
+
+当 `disable_tools: true` 时：
+
+1. **自动排除格式**：
+   - `claude_code` 和 `openai_codex` 格式会被自动排除
+   - 这两个格式主要用于工具调用场景
+
+2. **检测并拒绝**：
+   - 包含 `tools` 字段（工具定义）
+   - 包含 `tool_choice` 字段（工具选择）
+   - 包含 `tool_call` 类型的消息块（工具调用）
+   - 包含 `tool_result` 类型的消息块（工具结果）
+
+3. **配置优先级**：
+   - `disable_tools` 会覆盖 `from` 配置
+   - 即使 `from` 设置为 `"claude_code"`，启用 `disable_tools` 后也会被拒绝
+
+**使用场景**：
+```json
+{
+  "format_transform": {
+    "enabled": true,
+    "from": "auto",
+    "to": "openai_chat",
+    "disable_tools": true
+  }
+}
+```
+
+- **限制功能**：只允许简单对话，不允许工具调用
+- **兼容性**：避免上游 API 不支持工具调用导致的错误
+- **安全考虑**：防止工具调用绕过审核机制
+
+**错误信息示例**：
+```json
+{
+  "error": {
+    "code": "FORMAT_PARSE_ERROR",
+    "message": "Tool calling is disabled by configuration. The request contains tool definitions or tool-related content, which is not allowed. Please remove 'tools', 'tool_choice', tool calls, or tool results from your request.",
+    "type": "format_error"
+  }
+}
+```
 
 ## 🏗️ 架构设计
 
@@ -365,9 +414,11 @@ HTTP 客户端
     ├── extractor.py                # 文本抽取（避免审核工具参数）
     └── formats/
         ├── internal_models.py      # 内部统一模型（支持工具调用）
-        ├── parser.py               # 格式解析器注册表
+        ├── parser.py               # 格式解析器注册表（支持 disable_tools）
         ├── openai_chat.py          # OpenAI Chat 格式解析
-        └── claude_chat.py          # Claude Messages 格式解析
+        ├── claude_chat.py          # Claude Messages 格式解析
+        ├── claude_code.py          # Claude Code (Agent SDK) 格式解析
+        └── openai_codex.py         # OpenAI Codex/Completions 格式解析
 
 configs/
 ├── keywords.txt                    # 关键词黑名单
@@ -567,7 +618,7 @@ config = {
 | `CONFIG_PARSE_ERROR` | 配置解析错误 | 400 |
 | `BASIC_MODERATION_BLOCKED` | 基础审核拦截（关键词匹配） | 400 |
 | `SMART_MODERATION_BLOCKED` | 智能审核拦截（AI 或模型判定） | 400 |
-| `FORMAT_PARSE_ERROR` | 格式解析错误（strict_parse=true） | 400 |
+| `FORMAT_PARSE_ERROR` | 格式解析错误（strict_parse=true 或 disable_tools=true） | 400 |
 | `FORMAT_TRANSFORM_ERROR` | 格式转换错误 | 500 |
 | `UPSTREAM_ERROR` | 上游请求失败 | 500 |
 | `PROXY_ERROR` | 代理内部错误 | 500 |
@@ -803,6 +854,15 @@ cp -r configs/mod_profiles/*/history.db backups/
 - 确保所有测试通过
 
 ## 📝 更新日志
+
+### v1.1.0 (2024-11)
+
+- ✨ 新增 Claude Code (Agent SDK) 格式支持
+- ✨ 新增 OpenAI Codex/Completions 格式支持
+- ✨ 新增 `disable_tools` 配置选项，禁用工具调用
+- ✨ 格式识别互斥机制，避免误识别
+- 🐛 修复 `cache_control` 字段检测逻辑
+- 🐛 修复 `role="tool"` 消息格式冲突
 
 ### v1.0.0 (2024-11)
 
