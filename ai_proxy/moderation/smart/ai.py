@@ -4,7 +4,9 @@ AI 审核模块 - 支持三段式决策
 import os
 import json
 import random
-from typing import Tuple, Optional
+import hashlib
+from collections import OrderedDict
+from typing import Tuple, Optional, Dict
 from pydantic import BaseModel
 from openai import AsyncOpenAI
 
@@ -20,6 +22,56 @@ class ModerationResult(BaseModel):
     reason: Optional[str] = None
     source: str  # "ai" or "bow_model"
     confidence: Optional[float] = None
+
+
+# LRU 缓存池：每个配置一个缓存
+_moderation_cache: Dict[str, OrderedDict] = {}
+CACHE_SIZE = 20
+
+
+def _get_text_hash(text: str) -> str:
+    """计算文本哈希值"""
+    return hashlib.md5(text.encode('utf-8')).hexdigest()
+
+
+def _get_cache(profile_name: str) -> OrderedDict:
+    """获取或创建指定配置的缓存"""
+    if profile_name not in _moderation_cache:
+        _moderation_cache[profile_name] = OrderedDict()
+    return _moderation_cache[profile_name]
+
+
+def _check_cache(profile_name: str, text: str) -> Optional[ModerationResult]:
+    """检查缓存中是否存在审核结果"""
+    cache = _get_cache(profile_name)
+    text_hash = _get_text_hash(text)
+    
+    if text_hash in cache:
+        # 命中缓存，移到末尾（最近使用）
+        cache.move_to_end(text_hash)
+        result = cache[text_hash]
+        print(f"[DEBUG] 缓存命中: hash={text_hash[:8]}... 结果={'✅通过' if not result.violation else '❌违规'}")
+        return result
+    
+    return None
+
+
+def _save_to_cache(profile_name: str, text: str, result: ModerationResult):
+    """保存审核结果到缓存"""
+    cache = _get_cache(profile_name)
+    text_hash = _get_text_hash(text)
+    
+    # 添加到缓存
+    cache[text_hash] = result
+    cache.move_to_end(text_hash)
+    
+    # LRU 淘汰：如果超过大小限制，删除最老的
+    if len(cache) > CACHE_SIZE:
+        oldest_key = next(iter(cache))
+        cache.pop(oldest_key)
+        print(f"[DEBUG] 缓存满，淘汰最旧项: hash={oldest_key[:8]}...")
+    
+    print(f"[DEBUG] 保存到缓存: hash={text_hash[:8]}... 当前缓存大小={len(cache)}/{CACHE_SIZE}")
 
 
 async def ai_moderate(text: str, profile: ModerationProfile) -> ModerationResult:
@@ -101,12 +153,14 @@ async def run_ai_moderation_and_log(text: str, profile: ModerationProfile) -> Mo
 
 async def smart_moderation(text: str, cfg: dict) -> Tuple[bool, Optional[ModerationResult]]:
     """
-    智能审核入口 - 三段式决策
+    智能审核入口 - 三段式决策 + LRU缓存
     
     流程：
+    0. 检查缓存，命中则直接返回
     1. 随机抽样 -> AI 审核并记录
     2. 本地词袋模型 -> 低风险放行 / 高风险拒绝 / 中间交 AI
     3. 无模型 -> 全部交 AI
+    4. 保存结果到缓存
     """
     if not cfg.get("enabled", False):
         print(f"[DEBUG] 智能审核: 未启用，跳过")
@@ -116,6 +170,12 @@ async def smart_moderation(text: str, cfg: dict) -> Tuple[bool, Optional[Moderat
     print(f"  待审核文本: {text[:100]}{'...' if len(text) > 100 else ''}")
     
     profile_name = cfg.get("profile", "default")
+    
+    # 0. 检查缓存
+    cached_result = _check_cache(profile_name, text)
+    if cached_result is not None:
+        return not cached_result.violation, cached_result
+    
     profile = get_profile(profile_name)
     
     print(f"  使用配置: {profile_name}")
@@ -130,6 +190,7 @@ async def smart_moderation(text: str, cfg: dict) -> Tuple[bool, Optional[Moderat
     if rand_val < ai_rate:
         print(f"[DEBUG] 决策路径: 随机抽样 (rand={rand_val:.3f} < {ai_rate:.3f}) -> AI审核")
         result = await run_ai_moderation_and_log(text, profile)
+        _save_to_cache(profile_name, text, result)
         return not result.violation, result
     
     # 2. 尝试本地词袋模型
@@ -154,6 +215,7 @@ async def smart_moderation(text: str, cfg: dict) -> Tuple[bool, Optional[Moderat
                     source="bow_model",
                     confidence=p
                 )
+                _save_to_cache(profile_name, text, result)
                 return True, result
             
             # 高风险：直接拒绝
@@ -165,11 +227,13 @@ async def smart_moderation(text: str, cfg: dict) -> Tuple[bool, Optional[Moderat
                     source="bow_model",
                     confidence=p
                 )
+                _save_to_cache(profile_name, text, result)
                 return False, result
             
             # 不确定：交给 AI 复核
             print(f"[DEBUG] 词袋模型结果: ⚠️ 不确定 -> AI复核")
             result = await run_ai_moderation_and_log(text, profile)
+            _save_to_cache(profile_name, text, result)
             return not result.violation, result
             
         except Exception as e:
@@ -179,4 +243,5 @@ async def smart_moderation(text: str, cfg: dict) -> Tuple[bool, Optional[Moderat
     
     # 3. 无模型或失败：全部交 AI
     result = await run_ai_moderation_and_log(text, profile)
+    _save_to_cache(profile_name, text, result)
     return not result.violation, result
