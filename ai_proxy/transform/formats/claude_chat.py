@@ -34,17 +34,7 @@ def can_parse_claude_chat(path: str, headers: Dict[str, str], body: Dict[str, An
             if isinstance(first_msg, dict):
                 content = first_msg.get("content", [])
                 if isinstance(content, list) and content:
-                    # 检查第一个 content block
                     if isinstance(content[0], dict) and "type" in content[0]:
-                        # Claude Chat 特征：检查是否有 cache_control（Prompt Caching 功能）
-                        # 这是 Claude Chat API 的专有特性，Claude Code 不支持
-                        has_cache_control = any(
-                            isinstance(block, dict) and "cache_control" in block
-                            for block in content
-                        )
-                        if has_cache_control:
-                            return True
-                        # 即使没有 cache_control，如果结构符合也认为是 Claude Chat
                         return True
     return False
 

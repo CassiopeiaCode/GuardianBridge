@@ -20,22 +20,6 @@ def can_parse_claude_code(path: str, headers: Dict[str, str], body: Dict[str, An
     if "/messages" in path or "anthropic-version" in headers:
         return False
     
-    # 排斥带有 cache_control 的 Claude Chat 格式
-    if "messages" in body:
-        messages = body.get("messages", [])
-        if messages and isinstance(messages, list):
-            for msg in messages:
-                if isinstance(msg, dict):
-                    content = msg.get("content", [])
-                    if isinstance(content, list):
-                        # 检查是否有 cache_control 字段（Claude Chat Prompt Caching 特性）
-                        has_cache_control = any(
-                            isinstance(block, dict) and "cache_control" in block
-                            for block in content
-                        )
-                        if has_cache_control:
-                            return False
-    
     # Claude Code SDK 格式特征：
     # 1. 包含 prompt 字段（而不是 messages）
     # 2. 可能包含 options 字段
