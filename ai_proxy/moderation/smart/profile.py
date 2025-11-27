@@ -87,9 +87,15 @@ class ModerationProfile:
         
         template = self.get_prompt_template()
         
-        # 截断过长文本
-        if len(text) > self.config.prompt.max_text_length:
-            text = text[:self.config.prompt.max_text_length] + "..."
+        # 截断过长文本：保留前2/3和后1/3
+        max_len = self.config.prompt.max_text_length
+        if len(text) > max_len:
+            front_len = int(max_len * 2 / 3)
+            back_len = int(max_len * 1 / 3)
+            front_part = text[:front_len]
+            back_part = text[-back_len:]
+            text = front_part + "\n...[中间省略]...\n" + back_part
+            print(f"[DEBUG] 文本截断: 原长度={len(text)}, 保留前{front_len}+后{back_len}字符")
         
         # HTML 转义特殊字符，防止注入攻击
         escaped_text = html.escape(text)
