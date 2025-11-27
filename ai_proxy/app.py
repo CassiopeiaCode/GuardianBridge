@@ -7,6 +7,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from ai_proxy.proxy.router import router
 from ai_proxy.config import settings
+from ai_proxy.moderation.smart.scheduler import start_scheduler
 
 app = FastAPI(
     title="GuardianBridge",
@@ -29,6 +30,14 @@ async def global_exception_handler(request: Request, exc: Exception):
         status_code=500,
         content={"error": {"message": str(exc), "type": type(exc).__name__}}
     )
+
+@app.on_event("startup")
+async def startup_event():
+    """应用启动时执行"""
+    print("[INFO] GuardianBridge 启动")
+    # 启动模型训练调度器（每10分钟检查一次）
+    start_scheduler(check_interval_minutes=10)
+    print("[INFO] 模型训练调度器已启动")
 
 app.include_router(router)
 
