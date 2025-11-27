@@ -125,7 +125,8 @@ def detect_and_parse(
     path: str,
     headers: Dict[str, str],
     body: Dict[str, Any],
-    strict_parse: bool = False
+    strict_parse: bool = False,
+    disable_tools: bool = False
 ) -> Tuple[Optional[str], Optional[InternalChatRequest], Optional[str]]:
     """
     检测并解析请求格式
@@ -139,21 +140,36 @@ def detect_and_parse(
         headers: 请求头
         body: 请求体
         strict_parse: 是否启用严格解析模式
+        disable_tools: 是否禁用工具调用（如果启用，将拒绝包含工具的请求）
     
     Returns:
         (格式名称, 内部请求对象, 错误消息) 或 (None, None, 错误消息) 表示无法识别
     """
-    # 1. 确定候选格式列表
+    # 1. 如果禁用工具，排除仅支持工具的格式
+    if disable_tools:
+        # Claude Code 和 OpenAI Codex 主要用于工具调用，应该被排除
+        tool_only_formats = ["claude_code", "openai_codex"]
+    else:
+        tool_only_formats = []
+    
+    # 2. 确定候选格式列表
     if config_from == "auto":
-        candidates = list(PARSERS.keys())
+        candidates = [f for f in PARSERS.keys() if f not in tool_only_formats]
     elif isinstance(config_from, str):
+        if disable_tools and config_from in tool_only_formats:
+            # 如果配置要求使用被禁用的格式，返回错误
+            return None, None, (
+                f"Format '{config_from}' is not allowed when tools are disabled. "
+                f"Formats '{', '.join(tool_only_formats)}' are designed for tool calling and cannot be used with disable_tools=true. "
+                f"Please use 'openai_chat' or 'claude_chat' instead."
+            )
         candidates = [config_from]
     elif isinstance(config_from, list):
-        candidates = config_from
+        candidates = [f for f in config_from if f not in tool_only_formats]
     else:
-        candidates = list(PARSERS.keys())
+        candidates = [f for f in PARSERS.keys() if f not in tool_only_formats]
     
-    # 2. 按顺序尝试解析
+    # 3. 按顺序尝试解析
     for name in candidates:
         parser = PARSERS.get(name)
         if parser is None:
@@ -162,13 +178,24 @@ def detect_and_parse(
         try:
             if parser.can_parse(path, headers, body):
                 internal = parser.from_format(body)
+                
+                # 如果禁用工具，检查请求中是否包含工具
+                if disable_tools:
+                    has_tools = _check_has_tools(internal)
+                    if has_tools:
+                        return None, None, (
+                            f"Tool calling is disabled by configuration. "
+                            f"The request contains tool definitions or tool-related content, which is not allowed. "
+                            f"Please remove 'tools', 'tool_choice', tool calls, or tool results from your request."
+                        )
+                
                 return name, internal, None
         except Exception as e:
             # 解析失败，继续尝试下一个
             print(f"[WARN] Failed to parse as {name}: {e}")
             continue
     
-    # 3. 都不识别
+    # 4. 都不识别
     if strict_parse:
         # 严格模式：检查是否有其他格式可以解析
         all_formats = list(PARSERS.keys())
@@ -208,6 +235,30 @@ def detect_and_parse(
     
     # 非严格模式：返回 None 表示无法识别（将透传）
     return None, None, None
+
+
+def _check_has_tools(internal: InternalChatRequest) -> bool:
+    """
+    检查内部请求是否包含工具相关内容
+    
+    Returns:
+        True 如果包含工具定义、工具调用或工具结果
+    """
+    # 检查是否有工具定义
+    if internal.tools:
+        return True
+    
+    # 检查 tool_choice
+    if internal.tool_choice is not None:
+        return True
+    
+    # 检查消息中是否包含工具调用或工具结果
+    for msg in internal.messages:
+        for block in msg.content:
+            if block.type in ["tool_call", "tool_result"]:
+                return True
+    
+    return False
 
 
 def get_parser(format_name: str) -> Optional[FormatParser]:

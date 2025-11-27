@@ -133,7 +133,16 @@ async def _process_request_impl(
     # 检测并解析来源格式
     config_from = transform_cfg.get("from", "auto")
     strict_parse = transform_cfg.get("strict_parse", False)
-    src_format, internal_req, parse_error = detect_and_parse(config_from, path, headers, body, strict_parse)
+    disable_tools = transform_cfg.get("disable_tools", False)
+    
+    # 如果禁用工具且配置指定了 from，可能需要覆盖
+    if disable_tools and config_from != "auto":
+        # 警告：disable_tools 会覆盖 from 配置
+        print(f"[INFO] disable_tools=true will override format_transform.from config")
+    
+    src_format, internal_req, parse_error = detect_and_parse(
+        config_from, path, headers, body, strict_parse, disable_tools
+    )
     
     if src_format is None:
         # 无法识别格式
