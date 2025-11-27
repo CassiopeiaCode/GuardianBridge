@@ -181,10 +181,8 @@ async def smart_moderation(text: str, cfg: dict) -> Tuple[bool, Optional[Moderat
     print(f"  使用配置: {profile_name}")
     print(f"  AI审核概率: {profile.config.probability.ai_review_rate * 100:.1f}%")
     
-    random.seed(profile.config.probability.random_seed)
-    
     ai_rate = profile.config.probability.ai_review_rate
-    rand_val = random.random()
+    rand_val = random.random()  # 使用系统随机数，不设置种子
     
     # 1. 随机抽样：直接走 AI（用于持续产生标注）
     if rand_val < ai_rate:
