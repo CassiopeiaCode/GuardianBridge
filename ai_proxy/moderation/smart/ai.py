@@ -1,10 +1,11 @@
 """
-AI 审核模块 - 支持三段式决策
+AI 审核模块 - 支持三段式决策 (修复版)
 """
 import os
 import json
 import random
 import hashlib
+import threading
 from collections import OrderedDict
 from typing import Tuple, Optional, Dict
 from pydantic import BaseModel
@@ -13,6 +14,7 @@ from openai import AsyncOpenAI
 from ai_proxy.config import settings
 from ai_proxy.moderation.smart.profile import get_profile, ModerationProfile
 from ai_proxy.moderation.smart.storage import SampleStorage
+from ai_proxy.utils.memory_guard import track_container, check_container
 
 
 class ModerationResult(BaseModel):
@@ -26,7 +28,42 @@ class ModerationResult(BaseModel):
 
 # LRU 缓存池：每个配置一个缓存
 _moderation_cache: Dict[str, OrderedDict] = {}
+_cache_lock = threading.Lock()
 CACHE_SIZE = 20
+MAX_PROFILES = 50  # ✅ 限制最大配置数量
+
+
+# 全局 OpenAI 客户端池
+_openai_clients: Dict[str, AsyncOpenAI] = {}
+_client_lock = threading.Lock()
+
+
+def get_or_create_openai_client(profile: ModerationProfile) -> AsyncOpenAI:
+    """获取或创建 OpenAI 客户端（复用连接）"""
+    api_key = getattr(settings, profile.config.ai.api_key_env, None)
+    if not api_key:
+        raise ValueError(f"Environment variable {profile.config.ai.api_key_env} not set")
+    
+    # 使用 base_url 和 api_key 作为缓存键
+    cache_key = f"{profile.config.ai.base_url}:{api_key[:10]}"
+    
+    with _client_lock:
+        if cache_key not in _openai_clients:
+            _openai_clients[cache_key] = AsyncOpenAI(
+                api_key=api_key,
+                base_url=profile.config.ai.base_url,
+                timeout=profile.config.ai.timeout
+            )
+    
+    return _openai_clients[cache_key]
+
+
+async def cleanup_openai_clients():
+    """清理所有 OpenAI 客户端（应用关闭时调用）"""
+    with _client_lock:
+        for client in _openai_clients.values():
+            await client.close()
+        _openai_clients.clear()
 
 
 def _get_text_hash(text: str) -> str:
@@ -36,9 +73,23 @@ def _get_text_hash(text: str) -> str:
 
 def _get_cache(profile_name: str) -> OrderedDict:
     """获取或创建指定配置的缓存"""
-    if profile_name not in _moderation_cache:
-        _moderation_cache[profile_name] = OrderedDict()
-    return _moderation_cache[profile_name]
+    with _cache_lock:
+        if profile_name not in _moderation_cache:
+            # ✅ 限制缓存字典大小
+            if len(_moderation_cache) >= MAX_PROFILES:
+                # 删除最老的配置缓存（FIFO）
+                oldest = next(iter(_moderation_cache))
+                _moderation_cache.pop(oldest)
+                print(f"[DEBUG] 缓存字典已满，移除配置: {oldest}")
+            
+            _moderation_cache[profile_name] = OrderedDict()
+            # 追踪新创建的缓存
+            track_container(_moderation_cache[profile_name], f"moderation_cache.{profile_name}")
+        
+        # 定期检查整个缓存字典
+        check_container(_moderation_cache, "moderation_cache_dict")
+        
+        return _moderation_cache[profile_name]
 
 
 def _check_cache(profile_name: str, text: str) -> Optional[ModerationResult]:
@@ -46,12 +97,13 @@ def _check_cache(profile_name: str, text: str) -> Optional[ModerationResult]:
     cache = _get_cache(profile_name)
     text_hash = _get_text_hash(text)
     
-    if text_hash in cache:
-        # 命中缓存，移到末尾（最近使用）
-        cache.move_to_end(text_hash)
-        result = cache[text_hash]
-        print(f"[DEBUG] 缓存命中: hash={text_hash[:8]}... 结果={'✅通过' if not result.violation else '❌违规'}")
-        return result
+    with _cache_lock:
+        if text_hash in cache:
+            # 命中缓存，移到末尾（最近使用）
+            cache.move_to_end(text_hash)
+            result = cache[text_hash]
+            print(f"[DEBUG] 缓存命中: hash={text_hash[:8]}... 结果={'✅通过' if not result.violation else '❌违规'}")
+            return result
     
     return None
 
@@ -61,34 +113,26 @@ def _save_to_cache(profile_name: str, text: str, result: ModerationResult):
     cache = _get_cache(profile_name)
     text_hash = _get_text_hash(text)
     
-    # 添加到缓存
-    cache[text_hash] = result
-    cache.move_to_end(text_hash)
-    
-    # LRU 淘汰：如果超过大小限制，删除最老的
-    if len(cache) > CACHE_SIZE:
-        oldest_key = next(iter(cache))
-        cache.pop(oldest_key)
-        print(f"[DEBUG] 缓存满，淘汰最旧项: hash={oldest_key[:8]}...")
-    
-    print(f"[DEBUG] 保存到缓存: hash={text_hash[:8]}... 当前缓存大小={len(cache)}/{CACHE_SIZE}")
+    with _cache_lock:
+        # 添加到缓存
+        cache[text_hash] = result
+        cache.move_to_end(text_hash)
+        
+        # LRU 淘汰：如果超过大小限制，删除最老的
+        if len(cache) > CACHE_SIZE:
+            oldest_key = next(iter(cache))
+            cache.pop(oldest_key)
+            print(f"[DEBUG] 缓存满，淘汰最旧项: hash={oldest_key[:8]}...")
+        
+        print(f"[DEBUG] 保存到缓存: hash={text_hash[:8]}... 当前缓存大小={len(cache)}/{CACHE_SIZE}")
 
 
 async def ai_moderate(text: str, profile: ModerationProfile) -> ModerationResult:
-    """使用 AI 进行审核"""
-    api_key = getattr(settings, profile.config.ai.api_key_env, None)
-    if not api_key:
-        raise ValueError(f"Environment variable {profile.config.ai.api_key_env} not set")
-    
+    """使用 AI 进行审核（复用客户端）"""
     print(f"[MODERATION] AI审核开始")
     print(f"  文本: {text[:100]}{'...' if len(text) > 100 else ''}")
     
-    client = AsyncOpenAI(
-        api_key=api_key,
-        base_url=profile.config.ai.base_url,
-        timeout=profile.config.ai.timeout
-    )
-    
+    client = get_or_create_openai_client(profile)  # ✅ 复用客户端
     prompt = profile.render_prompt(text)
     
     try:
@@ -136,7 +180,7 @@ async def ai_moderate(text: str, profile: ModerationProfile) -> ModerationResult
         print(f"Traceback:")
         traceback.print_exc()
         print(f"{'='*60}\n")
-        raise  # 重新抛出异常，让全局处理器捕获
+        raise
 
 
 async def run_ai_moderation_and_log(text: str, profile: ModerationProfile) -> ModerationResult:
@@ -151,7 +195,7 @@ async def run_ai_moderation_and_log(text: str, profile: ModerationProfile) -> Mo
             violation=bool(existing_sample.label),
             category=existing_sample.category,
             reason=f"From DB: {existing_sample.created_at}",
-            source="ai",  # 来源仍标记为 ai（因为是之前AI审核的）
+            source="ai",
             confidence=None
         )
         print(f"[MODERATION] 数据库结果: {'❌ 违规' if result.violation else '✅ 通过'}")
@@ -200,7 +244,7 @@ async def smart_moderation(text: str, cfg: dict) -> Tuple[bool, Optional[Moderat
     print(f"  AI审核概率: {profile.config.probability.ai_review_rate * 100:.1f}%")
     
     ai_rate = profile.config.probability.ai_review_rate
-    rand_val = random.random()  # 使用系统随机数，不设置种子
+    rand_val = random.random()
     
     # 1. 随机抽样：直接走 AI（用于持续产生标注）
     if rand_val < ai_rate:

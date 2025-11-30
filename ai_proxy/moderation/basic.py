@@ -1,9 +1,11 @@
 """
-基础文本审核模块 - 关键词过滤
+基础文本审核模块 - 关键词过滤 (修复版)
 """
 import os
 import re
-from typing import Optional, Tuple, List, Pattern
+import threading
+from typing import Optional, Tuple, List, Pattern, Dict
+from ai_proxy.utils.memory_guard import track_container, check_container
 
 
 class KeywordFilter:
@@ -55,14 +57,36 @@ class KeywordFilter:
 
 
 # 全局过滤器缓存
-_filters = {}
+_filters: Dict[str, KeywordFilter] = {}
+_filter_lock = threading.Lock()
+MAX_FILTERS = 100  # ✅ 限制最大缓存数量
 
 
 def get_filter(keywords_file: str) -> KeywordFilter:
     """获取或创建关键词过滤器"""
-    if keywords_file not in _filters:
-        _filters[keywords_file] = KeywordFilter(keywords_file)
-    return _filters[keywords_file]
+    with _filter_lock:
+        if keywords_file not in _filters:
+            # ✅ 限制缓存大小
+            if len(_filters) >= MAX_FILTERS:
+                # 删除最老的过滤器（FIFO）
+                oldest = next(iter(_filters))
+                _filters.pop(oldest)
+                print(f"[DEBUG] 过滤器缓存已满，移除: {oldest}")
+            
+            _filters[keywords_file] = KeywordFilter(keywords_file)
+            # 追踪新创建的过滤器
+            track_container(_filters, "keyword_filters_dict")
+        
+        # 定期检查过滤器字典
+        check_container(_filters, "keyword_filters_dict")
+        
+        return _filters[keywords_file]
+
+
+def cleanup_filters():
+    """清理所有过滤器（应用关闭时调用）"""
+    with _filter_lock:
+        _filters.clear()
 
 
 def basic_moderation(text: str, cfg: dict) -> Tuple[bool, Optional[str]]:

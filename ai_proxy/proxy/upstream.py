@@ -1,10 +1,40 @@
 """
-上游 HTTP 客户端封装
+上游 HTTP 客户端封装 - 修复版
 """
 import httpx
 import json
 from typing import Optional, Dict, Any
 from fastapi.responses import StreamingResponse, JSONResponse
+from ai_proxy.utils.memory_guard import check_container
+
+
+# 全局 HTTP 客户端池（每个 base_url 一个客户端）
+_client_pool: Dict[str, httpx.AsyncClient] = {}
+
+
+def get_or_create_client(base_url: str) -> httpx.AsyncClient:
+    """获取或创建 HTTP 客户端（复用连接池）"""
+    if base_url not in _client_pool:
+        _client_pool[base_url] = httpx.AsyncClient(
+            timeout=60.0,
+            limits=httpx.Limits(
+                max_keepalive_connections=20,
+                max_connections=100,
+                keepalive_expiry=30.0
+            )
+        )
+    
+    # 定期检查客户端池
+    check_container(_client_pool, "http_client_pool")
+    
+    return _client_pool[base_url]
+
+
+async def cleanup_clients():
+    """清理所有客户端（应用关闭时调用）"""
+    for client in _client_pool.values():
+        await client.aclose()
+    _client_pool.clear()
 
 
 class UpstreamClient:
@@ -12,7 +42,7 @@ class UpstreamClient:
     
     def __init__(self, base_url: str):
         self.base_url = base_url.rstrip("/")
-        self.client = httpx.AsyncClient(timeout=60.0)
+        self.client = get_or_create_client(self.base_url)  # ✅ 复用客户端
     
     async def forward_request(
         self,
@@ -134,7 +164,3 @@ class UpstreamClient:
         except Exception as e:
             print(f"[ERROR] Response transform exception: {e}")
             raise
-    
-    async def close(self):
-        """关闭客户端"""
-        await self.client.aclose()
