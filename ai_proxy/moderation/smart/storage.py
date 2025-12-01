@@ -3,8 +3,9 @@
 """
 import sqlite3
 import threading
+import random
 from datetime import datetime
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Tuple
 from pydantic import BaseModel
 from contextlib import contextmanager
 
@@ -142,6 +143,64 @@ class SampleStorage:
             count = cursor.fetchone()[0]
         return count
     
+    def get_sample_ids(self, limit: int) -> List[int]:
+        """
+        获取样本ID列表（按创建时间降序）
+        
+        Args:
+            limit: 最多返回多少条ID
+            
+        Returns:
+            样本ID列表
+        """
+        with self.pool.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT id FROM samples ORDER BY created_at DESC LIMIT ?",
+                (limit,)
+            )
+            rows = cursor.fetchall()
+        return [row[0] for row in rows]
+    
+    def load_by_ids(self, ids: List[int]) -> List[Sample]:
+        """
+        根据ID列表批量加载样本
+        
+        Args:
+            ids: 样本ID列表
+            
+        Returns:
+            样本列表（保持ID顺序）
+        """
+        if not ids:
+            return []
+        
+        with self.pool.get_connection() as conn:
+            cursor = conn.cursor()
+            # 使用 IN 查询，然后手动排序以保持输入顺序
+            placeholders = ','.join('?' * len(ids))
+            query = f"""
+                SELECT id, text, label, category, created_at
+                FROM samples
+                WHERE id IN ({placeholders})
+            """
+            cursor.execute(query, ids)
+            rows = cursor.fetchall()
+        
+        # 构建样本字典
+        samples_dict = {}
+        for row in rows:
+            samples_dict[row[0]] = Sample(
+                id=row[0],
+                text=row[1],
+                label=row[2],
+                category=row[3],
+                created_at=row[4]
+            )
+        
+        # 按输入ID顺序返回
+        return [samples_dict[id] for id in ids if id in samples_dict]
+    
     def find_by_text(self, text: str) -> Optional[Sample]:
         """根据文本查找样本"""
         with self.pool.get_connection() as conn:
@@ -161,3 +220,119 @@ class SampleStorage:
                 created_at=row[4]
             )
         return None
+    
+    def get_label_counts(self) -> Tuple[int, int]:
+        """
+        获取各标签的样本数量
+        
+        Returns:
+            (pass_count, violation_count) - (成功数, 失败数)
+        """
+        with self.pool.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT label, COUNT(*) FROM samples GROUP BY label"
+            )
+            rows = cursor.fetchall()
+        
+        pass_count = 0
+        violation_count = 0
+        for label, count in rows:
+            if label == 0:
+                pass_count = count
+            elif label == 1:
+                violation_count = count
+        
+        return pass_count, violation_count
+    
+    def cleanup_excess_samples(self, max_items: int):
+        """
+        清理超出限制的样本数据
+        
+        策略:
+        1. 如果成功样本数 > max_items/2，随机删除到 max_items/2
+        2. 如果失败样本数 > max_items/2，随机删除到 max_items/2
+        3. 删除后执行 VACUUM 释放空间
+        
+        Args:
+            max_items: 数据库最大项目数
+        """
+        total = self.get_sample_count()
+        if total <= max_items:
+            print(f"[DB清理] 总样本数 {total} <= {max_items}，无需清理")
+            return
+        
+        pass_count, violation_count = self.get_label_counts()
+        print(f"[DB清理] 当前样本分布: 成功={pass_count}, 失败={violation_count}, 总计={total}")
+        
+        target_per_label = max_items // 2
+        deleted_count = 0
+        
+        # 清理成功样本
+        if pass_count > target_per_label:
+            excess = pass_count - target_per_label
+            print(f"[DB清理] 成功样本超出限制 ({pass_count} > {target_per_label})，需删除 {excess} 条")
+            deleted = self._delete_random_samples(label=0, count=excess)
+            deleted_count += deleted
+            print(f"[DB清理] 已删除 {deleted} 条成功样本")
+        
+        # 清理失败样本
+        if violation_count > target_per_label:
+            excess = violation_count - target_per_label
+            print(f"[DB清理] 失败样本超出限制 ({violation_count} > {target_per_label})，需删除 {excess} 条")
+            deleted = self._delete_random_samples(label=1, count=excess)
+            deleted_count += deleted
+            print(f"[DB清理] 已删除 {deleted} 条失败样本")
+        
+        if deleted_count > 0:
+            # 释放空间
+            print(f"[DB清理] 开始 VACUUM 释放空间...")
+            with self.pool.get_connection() as conn:
+                conn.execute("VACUUM")
+            print(f"[DB清理] VACUUM 完成")
+            
+            # 最终统计
+            new_total = self.get_sample_count()
+            new_pass, new_violation = self.get_label_counts()
+            print(f"[DB清理] 清理完成: 删除 {deleted_count} 条，剩余 {new_total} 条")
+            print(f"[DB清理] 新的样本分布: 成功={new_pass}, 失败={new_violation}")
+        else:
+            print(f"[DB清理] 无需删除样本")
+    
+    def _delete_random_samples(self, label: int, count: int) -> int:
+        """
+        随机删除指定标签的样本
+        
+        Args:
+            label: 标签 (0=pass, 1=violation)
+            count: 删除数量
+            
+        Returns:
+            实际删除数量
+        """
+        with self.pool.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            # 获取指定标签的所有ID
+            cursor.execute(
+                "SELECT id FROM samples WHERE label = ?",
+                (label,)
+            )
+            ids = [row[0] for row in cursor.fetchall()]
+            
+            if len(ids) <= count:
+                # 如果总数不足，全部删除
+                to_delete = ids
+            else:
+                # 随机选择要删除的ID
+                to_delete = random.sample(ids, count)
+            
+            # 批量删除
+            placeholders = ','.join('?' * len(to_delete))
+            cursor.execute(
+                f"DELETE FROM samples WHERE id IN ({placeholders})",
+                to_delete
+            )
+            conn.commit()
+            
+            return len(to_delete)

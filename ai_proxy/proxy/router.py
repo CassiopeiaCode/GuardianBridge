@@ -260,7 +260,7 @@ async def proxy_entry(cfg_and_upstream: str, request: Request):
     # 使用从 upstream_full 解析出的路径
     path = upstream_path
 
-    print("[DEBUG]", body)
+    # print("[DEBUG]", body)
 
     # 处理审核和转换
     passed, error_msg, data, src_format = await process_request(

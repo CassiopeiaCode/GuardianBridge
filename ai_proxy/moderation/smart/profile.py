@@ -46,6 +46,13 @@ class BoWTrainingConfig(BaseModel):
     
     # 模型类型
     model_type: str = "sgd_logistic"  # sgd_logistic / logistic
+    
+    # 增量训练配置
+    batch_size: int = 2000  # 每批训练的样本数
+    max_seconds: int = 300  # 最多训练时间（秒），默认5分钟
+    
+    # 数据库管理配置
+    max_db_items: int = 100000  # 数据库最大项目数，超出后自动清理
 
 
 class ProfileConfig(BaseModel):
