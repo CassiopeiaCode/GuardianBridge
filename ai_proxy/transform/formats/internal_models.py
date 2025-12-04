@@ -26,12 +26,19 @@ class InternalToolResult(BaseModel):
     output: Any
 
 
+class InternalImageBlock(BaseModel):
+    """图片内容块"""
+    url: str
+    detail: Optional[str] = None
+
+
 class InternalContentBlock(BaseModel):
     """内容块 - 支持文本、工具调用、工具结果"""
-    type: Literal["text", "tool_call", "tool_result"]
+    type: Literal["text", "tool_call", "tool_result", "image_url"]
     text: Optional[str] = None
     tool_call: Optional[InternalToolCall] = None
     tool_result: Optional[InternalToolResult] = None
+    image_url: Optional[InternalImageBlock] = None
 
 
 class InternalMessage(BaseModel):

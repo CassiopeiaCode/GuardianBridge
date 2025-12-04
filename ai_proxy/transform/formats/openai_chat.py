@@ -10,7 +10,8 @@ from ai_proxy.transform.formats.internal_models import (
     InternalContentBlock,
     InternalTool,
     InternalToolCall,
-    InternalToolResult
+    InternalToolResult,
+    InternalImageBlock,
 )
 
 
@@ -83,10 +84,32 @@ def from_openai_chat(body: Dict[str, Any]) -> InternalChatRequest:
         if isinstance(content, str) and content:
             blocks.append(InternalContentBlock(type="text", text=content))
         elif isinstance(content, list):
-            # 多部分内容
-            texts = [p.get("text", "") for p in content if p.get("type") == "text"]
-            if texts:
-                blocks.append(InternalContentBlock(type="text", text="\n".join(texts)))
+            # 多部分内容，逐块解析，支持文本与图片
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                part_type = part.get("type")
+                if part_type == "text":
+                    blocks.append(
+                        InternalContentBlock(
+                            type="text",
+                            text=part.get("text") or "",
+                        )
+                    )
+                elif part_type == "image_url":
+                    image_data = part.get("image_url") or {}
+                    url = image_data.get("url")
+                    if not url:
+                        continue
+                    blocks.append(
+                        InternalContentBlock(
+                            type="image_url",
+                            image_url=InternalImageBlock(
+                                url=url,
+                                detail=image_data.get("detail"),
+                            ),
+                        )
+                    )
         
         # 2. 处理 tool role 的消息（工具结果）
         if msg.get("role") == "tool":
@@ -156,19 +179,35 @@ def to_openai_chat(req: InternalChatRequest) -> Dict[str, Any]:
     messages = []
     for m in req.messages:
         # 收集不同类型的内容块
-        text_blocks = [b.text for b in m.content if b.type == "text" and b.text]
+        text_blocks = [b.text for b in m.content if b.type == "text" and b.text is not None]
         tool_call_blocks = [b.tool_call for b in m.content if b.type == "tool_call"]
         tool_result_blocks = [b.tool_result for b in m.content if b.type == "tool_result"]
+        image_blocks = [b.image_url for b in m.content if b.type == "image_url" and b.image_url]
         
         # 非 tool role 的消息
         if m.role != "tool":
             msg = {"role": m.role}
             
-            # 添加文本内容
-            if text_blocks:
-                msg["content"] = "\n".join(text_blocks)
-            elif not tool_call_blocks:
-                msg["content"] = ""
+            # 添加内容块（文本/图片）
+            if image_blocks:
+                parts = []
+                for block in m.content:
+                    if block.type == "text" and block.text is not None:
+                        parts.append({"type": "text", "text": block.text})
+                    elif block.type == "image_url" and block.image_url:
+                        image_part = {
+                            "type": "image_url",
+                            "image_url": {"url": block.image_url.url},
+                        }
+                        if block.image_url.detail:
+                            image_part["image_url"]["detail"] = block.image_url.detail
+                        parts.append(image_part)
+                msg["content"] = parts or ""
+            else:
+                if text_blocks:
+                    msg["content"] = "\n".join(text_blocks)
+                elif not tool_call_blocks:
+                    msg["content"] = ""
             
             # 添加工具调用
             if tool_call_blocks:
@@ -221,8 +260,34 @@ def openai_chat_resp_to_internal(resp: Dict[str, Any]) -> InternalChatResponse:
     
     # 文本内容
     content = message.get("content")
-    if content:
+    if isinstance(content, str) and content:
         blocks.append(InternalContentBlock(type="text", text=content))
+    elif isinstance(content, list):
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            part_type = part.get("type")
+            if part_type == "text":
+                blocks.append(
+                    InternalContentBlock(
+                        type="text",
+                        text=part.get("text") or "",
+                    )
+                )
+            elif part_type == "image_url":
+                image_data = part.get("image_url") or {}
+                url = image_data.get("url")
+                if not url:
+                    continue
+                blocks.append(
+                    InternalContentBlock(
+                        type="image_url",
+                        image_url=InternalImageBlock(
+                            url=url,
+                            detail=image_data.get("detail"),
+                        ),
+                    )
+                )
     
     # 工具调用
     for tc in message.get("tool_calls", []):
@@ -268,8 +333,25 @@ def internal_to_openai_resp(resp: InternalChatResponse) -> Dict[str, Any]:
     # 构建消息
     message = {"role": "assistant"}
     
-    text_blocks = [b.text for b in last_msg.content if b.type == "text" and b.text]
-    if text_blocks:
+    text_blocks = [b.text for b in last_msg.content if b.type == "text" and b.text is not None]
+    image_blocks = [b.image_url for b in last_msg.content if b.type == "image_url" and b.image_url]
+
+    if image_blocks:
+        parts = []
+        for block in last_msg.content:
+            if block.type == "text" and block.text is not None:
+                parts.append({"type": "text", "text": block.text})
+            elif block.type == "image_url" and block.image_url:
+                image_part = {
+                    "type": "image_url",
+                    "image_url": {"url": block.image_url.url},
+                }
+                if block.image_url.detail:
+                    image_part["image_url"]["detail"] = block.image_url.detail
+                parts.append(image_part)
+        if parts:
+            message["content"] = parts
+    elif text_blocks:
         message["content"] = "\n".join(text_blocks)
     
     tool_calls = []
