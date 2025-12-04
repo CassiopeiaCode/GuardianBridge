@@ -30,11 +30,23 @@ def can_parse_claude_chat(path: str, headers: Dict[str, str], body: Dict[str, An
     # 1. 优先排斥 OpenAI Chat 格式
     if "messages" in body and isinstance(body["messages"], list):
         for msg in body["messages"]:
-            if isinstance(msg, dict) and msg.get("role") == "tool":
-                return False # 这是 OpenAI 的 role="tool"
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("role") == "tool":
+                return False  # 这是 OpenAI 的 role="tool"
+            content = msg.get("content")
+            if isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "image_url":
+                        # OpenAI 多模态专用格式
+                        return False
     
     # 2. 检查 Claude Chat 的关键标识
-    if "/messages" in path or "anthropic-version" in headers:
+    if (
+        "/messages" in path
+        or "anthropic-version" in {k.lower(): v for k, v in headers.items()}
+        or "anthropic_version" in body
+    ):
         return True
     
     # 3. 检查 Claude Chat 的 body 结构
