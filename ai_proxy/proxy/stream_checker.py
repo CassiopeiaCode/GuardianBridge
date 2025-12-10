@@ -156,6 +156,11 @@ def check_response_content(response: Dict[str, Any], format_name: str) -> Tuple[
     char_threshold = 2
     
     try:
+        # 检查响应是否为字典类型
+        if not isinstance(response, dict):
+            print(f"[WARN] Response is not a dict: {type(response)}, allowing it to pass")
+            return True, None
+        
         if format_name == "gemini_chat":
             # Gemini 格式
             candidates = response.get("candidates", [])
