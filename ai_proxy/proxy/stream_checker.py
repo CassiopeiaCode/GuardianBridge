@@ -77,17 +77,21 @@ class StreamChecker:
 
     def _parse_data(self, data: dict):
         """解析单条数据"""
-        # OpenAI Chat 格式
+        # OpenAI Chat 和 Codex 格式
         if "choices" in data and isinstance(data["choices"], list):
             for choice in data["choices"]:
+                # OpenAI Chat: 使用 delta.content
                 delta = choice.get("delta", {})
-                
-                # 检查内容
                 content = delta.get("content")
                 if content:
                     self.accumulated_content += content
                 
-                # 检查工具调用
+                # OpenAI Codex/Completions: 使用 text 字段
+                text = choice.get("text")
+                if text:
+                    self.accumulated_content += text
+                
+                # 检查工具调用（仅 Chat 格式支持）
                 if delta.get("tool_calls"):
                     self.has_tool_call = True
                     
