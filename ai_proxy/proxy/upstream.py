@@ -6,6 +6,7 @@ import json
 from typing import Optional, Dict, Any
 from fastapi.responses import StreamingResponse, JSONResponse
 from ai_proxy.utils.memory_guard import check_container
+from ai_proxy.proxy.stream_checker import StreamChecker
 
 
 # 全局 HTTP 客户端池（每个 base_url 一个客户端）
@@ -52,7 +53,8 @@ class UpstreamClient:
         body: Optional[Dict[str, Any]] = None,
         is_stream: bool = False,
         src_format: Optional[str] = None,
-        target_format: Optional[str] = None
+        target_format: Optional[str] = None,
+        delay_stream_header: bool = False
     ):
         """
         转发请求到上游
@@ -60,6 +62,7 @@ class UpstreamClient:
         Args:
             src_format: 客户端原始格式（用于响应转换）
             target_format: 上游API格式（响应需要从此格式转换回 src_format）
+            delay_stream_header: 是否延迟发送流式响应头（直到内容>2chars或有工具调用）
         """
         # 过滤掉不需要的头，并移除 Accept-Encoding 以避免 zstd 压缩
         filtered_headers = {
@@ -73,21 +76,91 @@ class UpstreamClient:
         
         try:
             if is_stream:
-                # 流式请求
-                async def stream_generator():
-                    async with self.client.stream(
-                        method,
-                        url,
-                        headers=filtered_headers,
-                        json=body
-                    ) as response:
-                        async for chunk in response.aiter_bytes():
-                            yield chunk
-                
-                return StreamingResponse(
-                    stream_generator(),
-                    media_type="text/event-stream"
+                # 流式请求 - 使用手动请求管理以支持延迟响应头
+                req = self.client.build_request(
+                    method,
+                    url,
+                    headers=filtered_headers,
+                    json=body
                 )
+                
+                response = await self.client.send(req, stream=True)
+                
+                if response.status_code != 200:
+                    await response.aclose()
+                    # 非 200，读取 body 并返回 JSONResponse
+                    err_body = await response.aread()
+                    try:
+                        content = json.loads(err_body)
+                    except:
+                        content = {"error": err_body.decode('utf-8', errors='ignore')}
+                    return JSONResponse(status_code=response.status_code, content=content)
+
+                # 启用延迟检查
+                if delay_stream_header:
+                    checker = StreamChecker(target_format or "openai_chat")
+                    buffer = []
+                    valid = False
+                    
+                    try:
+                        # 预读迭代器
+                        aiter = response.aiter_bytes()
+                        
+                        # 预读循环
+                        async for chunk in aiter:
+                            buffer.append(chunk)
+                            if checker.check_chunk(chunk):
+                                valid = True
+                                break
+                            # 保护性限制：如果超过 8KB 还没满足条件，强制放行
+                            if sum(len(b) for b in buffer) > 8192:
+                                valid = True # 视为通过，避免一直卡住
+                                break
+                        
+                        # 如果循环结束（流结束了）还没有 valid，检查一下
+                        # 此时 valid 仍为 False，buffer 包含所有数据
+                        if not valid:
+                            # 检查是否真的为空或者只有空白字符
+                            # 这里策略：如果流正常结束但内容很少，我们还是返回它
+                            # 只有在发生异常断开时才认为是错误
+                            pass
+                            
+                    except Exception as e:
+                        print(f"[STREAM_PRE_READ_ERROR] {e}")
+                        await response.aclose()
+                        return JSONResponse(
+                            status_code=502,
+                            content={"error": {"code": "UPSTREAM_STREAM_ERROR", "message": "Stream disconnected before valid content"}}
+                        )
+
+                    # 构造新的生成器，先发 buffer，再发剩余流
+                    async def combined_generator():
+                        try:
+                            for chunk in buffer:
+                                yield chunk
+                            async for chunk in aiter:
+                                yield chunk
+                        finally:
+                            await response.aclose()
+
+                    return StreamingResponse(
+                        combined_generator(),
+                        media_type="text/event-stream"
+                    )
+                
+                else:
+                    # 不延迟，直接透传
+                    async def simple_generator():
+                        try:
+                            async for chunk in response.aiter_bytes():
+                                yield chunk
+                        finally:
+                            await response.aclose()
+                            
+                    return StreamingResponse(
+                        simple_generator(),
+                        media_type="text/event-stream"
+                    )
             else:
                 # 非流式请求（httpx 会自动处理 gzip 解压）
                 response = await self.client.request(

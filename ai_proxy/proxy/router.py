@@ -294,6 +294,10 @@ async def proxy_entry(cfg_and_upstream: str, request: Request):
         and src_format != transform_cfg.get("to", src_format)
     )
 
+    # 获取流式响应头延迟配置
+    # 默认为 False
+    delay_stream_header = transform_cfg.get("delay_stream_header", False)
+    
     # 转发请求
     try:
         response = await upstream_client.forward_request(
@@ -304,6 +308,7 @@ async def proxy_entry(cfg_and_upstream: str, request: Request):
             is_stream=body.get("stream", False) if isinstance(body, dict) else False,
             src_format=src_format if need_response_transform else None,
             target_format=transform_cfg.get("to") if need_response_transform else None,
+            delay_stream_header=delay_stream_header
         )
         return response
     except Exception as e:

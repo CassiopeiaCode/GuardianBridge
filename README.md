@@ -345,7 +345,8 @@ response = client.chat.completions.create(
     "to": "claude_chat",
     "stream": "auto",
     "strict_parse": false,
-    "disable_tools": false
+    "disable_tools": false,
+    "delay_stream_header": false
   }
 }
 ```
@@ -366,6 +367,9 @@ response = client.chat.completions.create(
 - `disable_tools`: 禁用工具调用（新增）
   - `false`: 允许工具调用（默认）
   - `true`: 禁用工具调用，拒绝包含工具的请求
+- `delay_stream_header`: 延迟发送流式响应头（新增）
+  - `false`: 立即发送响应头（默认）
+  - `true`: 暂缓发送响应头，直到累计 >2 字符内容或出现工具调用。若上游在有效内容前断开连接，将返回 JSON 错误而非 200 OK + 断流。
 
 #### 禁用工具调用配置
 
