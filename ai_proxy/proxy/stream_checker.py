@@ -28,8 +28,15 @@ class StreamChecker:
         except UnicodeDecodeError:
             # 忽略解码错误的块（可能是被截断的多字节字符）
             return False
-            
-        # 简单的 SSE 解析
+        
+        # 检测格式：Gemini 使用 JSON Lines，OpenAI/Claude 使用 SSE
+        if self.format_name == "gemini_chat":
+            return self._check_gemini_format(text)
+        else:
+            return self._check_sse_format(text)
+    
+    def _check_sse_format(self, text: str) -> bool:
+        """检查 SSE 格式（OpenAI/Claude）"""
         for line in text.split('\n'):
             line = line.strip()
             if not line.startswith('data: '):
@@ -42,6 +49,24 @@ class StreamChecker:
             try:
                 data = json.loads(data_str)
                 self._parse_data(data)
+                
+                if self.has_tool_call or len(self.accumulated_content) > self.char_threshold:
+                    return True
+            except json.JSONDecodeError:
+                continue
+                
+        return False
+    
+    def _check_gemini_format(self, text: str) -> bool:
+        """检查 Gemini JSON Lines 格式"""
+        for line in text.split('\n'):
+            line = line.strip()
+            if not line:
+                continue
+                
+            try:
+                data = json.loads(line)
+                self._parse_gemini_data(data)
                 
                 if self.has_tool_call or len(self.accumulated_content) > self.char_threshold:
                     return True
@@ -84,3 +109,22 @@ class StreamChecker:
             elif dtype == "content_block_start":
                  if data.get("content_block", {}).get("type") == "tool_use":
                      self.has_tool_call = True
+    
+    def _parse_gemini_data(self, data: dict):
+        """解析 Gemini 格式的数据"""
+        candidates = data.get("candidates", [])
+        if not candidates:
+            return
+        
+        for candidate in candidates:
+            content = candidate.get("content", {})
+            parts = content.get("parts", [])
+            
+            for part in parts:
+                # 检查文本内容
+                if "text" in part:
+                    self.accumulated_content += part.get("text", "")
+                
+                # 检查函数调用（Gemini 的工具调用）
+                if "functionCall" in part:
+                    self.has_tool_call = True
