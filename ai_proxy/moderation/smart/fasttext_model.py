@@ -72,6 +72,7 @@ def train_fasttext_model(profile: ModerationProfile):
             maxn=cfg.maxn,
             bucket=cfg.bucket,
             loss="ova",  # one-vs-all，适合二分类
+            thread=2,  # 限制为单线程，降低 CPU 使用率
             verbose=2
         )
         

@@ -137,28 +137,25 @@ class SampleStorage:
     
     def load_balanced_samples(self, max_samples: int = 20000) -> List[Sample]:
         """
-        加载样本并强制保持标签平衡
+        加载样本并保持标签平衡（欠采样策略，不复制样本）
         
         策略：
-        1. 每个标签加载 max_samples/2 个样本
-        2. 如果某个标签样本不足，通过复制现有样本来补足
-        3. 最终返回完全平衡的样本集（正常:违规 = 1:1）
+        1. 获取两个标签的样本数量
+        2. 取较小类别的数量作为每个标签的目标数量
+        3. 从每个标签中随机抽取目标数量的样本
+        4. 不复制任何样本，保证每个样本只出现一次
+        5. 最终返回平衡的样本集（正常:违规 = 1:1）
         
         Args:
             max_samples: 最大样本数（必须是偶数，如果是奇数会向下取整）
             
         Returns:
-            平衡的样本列表
+            平衡的样本列表（不包含重复样本）
         """
         if max_samples <= 0:
             return []
         
-        # 确保每个标签的目标数量
-        target_per_label = max_samples // 2
-        
-        if target_per_label == 0:
-            return []
-        
+        # 获取各标签的样本数量
         pass_count, violation_count = self.get_label_counts()
         
         # 如果某个标签完全没有样本，返回空列表
@@ -167,44 +164,41 @@ class SampleStorage:
             print(f"[WARNING] 无法进行平衡采样，返回空列表")
             return []
         
-        # 加载正常样本
-        pass_samples = self._load_samples_by_label(0, min(target_per_label, pass_count))
-        print(f"[BalancedSampling] 正常样本: 加载 {len(pass_samples)}/{target_per_label}")
+        # 计算平衡数量（取较小类别的数量，实现欠采样）
+        balanced_count = min(pass_count, violation_count)
         
-        # 加载违规样本
-        violation_samples = self._load_samples_by_label(1, min(target_per_label, violation_count))
-        print(f"[BalancedSampling] 违规样本: 加载 {len(violation_samples)}/{target_per_label}")
+        # 如果有 max_samples 限制，进一步限制每类的数量
+        target_per_label = max_samples // 2
+        if target_per_label > 0:
+            balanced_count = min(balanced_count, target_per_label)
         
-        # 如果正常样本不足，通过复制来补足
-        if len(pass_samples) < target_per_label:
-            original_count = len(pass_samples)
-            while len(pass_samples) < target_per_label:
-                # 循环复制样本
-                for sample in pass_samples[:original_count]:
-                    if len(pass_samples) >= target_per_label:
-                        break
-                    pass_samples.append(sample)
-            print(f"[BalancedSampling] 正常样本不足，已复制到 {len(pass_samples)} 个")
+        if balanced_count == 0:
+            print(f"[WARNING] 计算出的平衡数量为0，返回空列表")
+            return []
         
-        # 如果违规样本不足，通过复制来补足
-        if len(violation_samples) < target_per_label:
-            original_count = len(violation_samples)
-            while len(violation_samples) < target_per_label:
-                # 循环复制样本
-                for sample in violation_samples[:original_count]:
-                    if len(violation_samples) >= target_per_label:
-                        break
-                    violation_samples.append(sample)
-            print(f"[BalancedSampling] 违规样本不足，已复制到 {len(violation_samples)} 个")
+        print(f"[BalancedSampling] 数据库样本分布: 正常={pass_count}, 违规={violation_count}")
+        print(f"[BalancedSampling] 使用欠采样策略，每类抽取 {balanced_count} 个样本（不复制）")
+        
+        # 加载并随机抽取正常样本
+        pass_samples = self._load_samples_by_label(0, pass_count)  # 先加载全部
+        if len(pass_samples) > balanced_count:
+            pass_samples = random.sample(pass_samples, balanced_count)  # 随机抽取
+        print(f"[BalancedSampling] 正常样本: {len(pass_samples)} 个")
+        
+        # 加载并随机抽取违规样本
+        violation_samples = self._load_samples_by_label(1, violation_count)  # 先加载全部
+        if len(violation_samples) > balanced_count:
+            violation_samples = random.sample(violation_samples, balanced_count)  # 随机抽取
+        print(f"[BalancedSampling] 违规样本: {len(violation_samples)} 个")
         
         # 合并样本
         combined = pass_samples + violation_samples
         
         # 打乱顺序（重要：避免模型学到标签顺序）
-        import random
         random.shuffle(combined)
         
         print(f"[BalancedSampling] 最终样本: 正常={len(pass_samples)}, 违规={len(violation_samples)}, 总计={len(combined)}")
+        print(f"[BalancedSampling] ✓ 所有样本唯一，无重复")
         
         return combined
     
