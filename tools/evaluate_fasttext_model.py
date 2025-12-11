@@ -9,9 +9,11 @@ fastText 模型评估脚本
 - F1 分数 (F1 Score)
 - 混淆矩阵 (Confusion Matrix)
 
-根据配置自动选择：
-- use_jieba=true: 使用 jieba 分词进行预测
-- use_jieba=false: 使用原版字符级 n-gram
+根据配置自动选择分词方式：
+- use_tiktoken=false, use_jieba=false: 字符级 n-gram
+- use_tiktoken=false, use_jieba=true: jieba 中文分词
+- use_tiktoken=true, use_jieba=false: tiktoken BPE 分词
+- use_tiktoken=true, use_jieba=true: tiktoken + jieba 组合
 
 使用方法:
     python tools/evaluate_fasttext_model.py <profile_name> [--sample-size N]
@@ -39,7 +41,9 @@ sys.path.insert(0, str(project_root))
 from ai_proxy.moderation.smart.profile import get_profile
 from ai_proxy.moderation.smart.storage import SampleStorage
 from ai_proxy.moderation.smart.fasttext_model import fasttext_model_exists, _load_fasttext_with_cache
+from ai_proxy.moderation.smart.fasttext_model_jieba import tokenize_text
 import jieba
+import tiktoken
 from tqdm import tqdm
 
 
@@ -71,9 +75,22 @@ def evaluate_fasttext_model(profile_name: str, sample_size: int = 100):
     
     print(f"✅ 模型文件: {profile.get_fasttext_model_path()}")
     
-    # 检查是否使用 jieba
-    use_jieba = profile.config.fasttext_training.use_jieba
-    print(f"✅ 分词方式: {'jieba 中文分词' if use_jieba else '字符级 n-gram'}")
+    # 检查分词配置
+    cfg = profile.config.fasttext_training
+    use_jieba = cfg.use_jieba
+    use_tiktoken = cfg.use_tiktoken
+    
+    # 确定分词模式描述
+    if use_tiktoken and use_jieba:
+        tokenize_mode = f"tiktoken + jieba 组合 (模型: {cfg.tiktoken_model})"
+    elif use_tiktoken:
+        tokenize_mode = f"tiktoken BPE (模型: {cfg.tiktoken_model})"
+    elif use_jieba:
+        tokenize_mode = "jieba 中文分词"
+    else:
+        tokenize_mode = "字符级 n-gram"
+    
+    print(f"✅ 分词方式: {tokenize_mode}")
     
     # 加载数据库样本
     storage = SampleStorage(profile.get_db_path())
@@ -143,10 +160,9 @@ def evaluate_fasttext_model(profile_name: str, sample_size: int = 100):
         text = sample.text.replace('\n', ' ').replace('\r', ' ')
         
         # 根据配置选择分词方式
-        if use_jieba:
-            # 使用 jieba 分词
-            words = jieba.cut(text)
-            text = ' '.join(words)
+        if use_jieba or use_tiktoken:
+            # 使用高级分词
+            text = tokenize_text(text, use_jieba, use_tiktoken, cfg.tiktoken_model)
         
         # 预测
         try:
@@ -252,14 +268,20 @@ def evaluate_fasttext_model(profile_name: str, sample_size: int = 100):
         print(f"  平均值: {sum(proba_1)/len(proba_1):.4f}")
         print(f"  中位数: {sorted(proba_1)[len(proba_1)//2]:.4f}")
     
-    # 阈值分析
+    # 阈值分析（更细粒度）
     print(f"\n{'='*60}")
-    print(f"阈值分析")
+    print(f"阈值分析（细粒度）")
     print(f"{'='*60}\n")
     
-    thresholds = [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
-    print(f"{'阈值':<8} {'准确率':<10} {'精确率':<10} {'召回率':<10} {'F1分数':<10}")
-    print(f"{'-'*60}")
+    # 生成更细的阈值范围：0.05 到 0.95，步长 0.05
+    thresholds = [i * 0.05 for i in range(1, 20)]  # 0.05, 0.10, ..., 0.95
+    
+    print(f"{'阈值':<8} {'准确率':<10} {'精确率':<10} {'召回率':<10} {'F1分数':<10} {'FPR':<10} {'FNR':<10}")
+    print(f"{'-'*80}")
+    
+    best_f1 = 0
+    best_threshold = 0.5
+    threshold_results = []
     
     for threshold in thresholds:
         # 使用不同阈值重新计算
@@ -274,8 +296,30 @@ def evaluate_fasttext_model(profile_name: str, sample_size: int = 100):
         prec_t = tp_t / (tp_t + fp_t) if (tp_t + fp_t) > 0 else 0
         rec_t = tp_t / (tp_t + fn_t) if (tp_t + fn_t) > 0 else 0
         f1_t = 2 * (prec_t * rec_t) / (prec_t + rec_t) if (prec_t + rec_t) > 0 else 0
+        fpr_t = fp_t / (fp_t + tn_t) if (fp_t + tn_t) > 0 else 0
+        fnr_t = fn_t / (fn_t + tp_t) if (fn_t + tp_t) > 0 else 0
         
-        print(f"{threshold:<8.2f} {acc_t:<10.4f} {prec_t:<10.4f} {rec_t:<10.4f} {f1_t:<10.4f}")
+        threshold_results.append({
+            'threshold': threshold,
+            'accuracy': acc_t,
+            'precision': prec_t,
+            'recall': rec_t,
+            'f1': f1_t,
+            'fpr': fpr_t,
+            'fnr': fnr_t
+        })
+        
+        # 记录最佳 F1 分数
+        if f1_t > best_f1:
+            best_f1 = f1_t
+            best_threshold = threshold
+        
+        print(f"{threshold:<8.2f} {acc_t:<10.4f} {prec_t:<10.4f} {rec_t:<10.4f} {f1_t:<10.4f} {fpr_t:<10.4f} {fnr_t:<10.4f}")
+    
+    # 显示最佳阈值
+    print(f"\n{'='*80}")
+    print(f"🎯 最佳阈值: {best_threshold:.2f} (F1 分数: {best_f1:.4f})")
+    print(f"{'='*80}")
     
     print(f"\n{'='*60}")
     print(f"评估完成")

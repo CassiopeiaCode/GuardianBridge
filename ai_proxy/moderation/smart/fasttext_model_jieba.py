@@ -1,9 +1,14 @@
 """
-fastText 模型训练和预测模块（jieba 分词版本）
-使用 jieba 分词 + fastText 进行文本分类
+fastText 模型训练和预测模块（高级分词版本）
+支持多种分词方式：jieba、tiktoken、组合分词
+
+分词模式：
+1. jieba only: 使用 jieba 中文分词
+2. tiktoken only: 使用 tiktoken BPE 分词
+3. tiktoken + jieba: 先 tiktoken 再 jieba（实验性）
 
 相比原版的改进：
-- 使用 jieba 分词，更符合中文语言特性
+- 支持多种分词方式
 - 关闭子词 n-gram (minn=0, maxn=0)
 - 使用词级 n-gram 提取特征
 - 使用 tqdm 显示分词进度
@@ -12,10 +17,65 @@ import os
 import tempfile
 import fasttext
 import jieba
-from typing import Dict, Tuple, Optional
+import tiktoken
+from typing import Dict, Tuple, Optional, List
 from tqdm import tqdm
 from ai_proxy.moderation.smart.profile import ModerationProfile
 from ai_proxy.moderation.smart.storage import SampleStorage
+
+
+# tiktoken 编码器缓存
+_tiktoken_encoders: Dict[str, tiktoken.Encoding] = {}
+
+
+def get_tiktoken_encoder(model_name: str = "cl100k_base") -> tiktoken.Encoding:
+    """获取或创建 tiktoken 编码器（带缓存）"""
+    if model_name not in _tiktoken_encoders:
+        _tiktoken_encoders[model_name] = tiktoken.get_encoding(model_name)
+    return _tiktoken_encoders[model_name]
+
+
+def tokenize_text(text: str, use_jieba: bool, use_tiktoken: bool, tiktoken_model: str = "cl100k_base") -> str:
+    """
+    根据配置对文本进行分词
+    
+    Args:
+        text: 待分词文本
+        use_jieba: 是否使用 jieba
+        use_tiktoken: 是否使用 tiktoken
+        tiktoken_model: tiktoken 模型名称
+        
+    Returns:
+        分词后的文本（空格分隔）
+    """
+    if use_tiktoken and use_jieba:
+        # 组合模式：先 tiktoken 再 jieba
+        encoder = get_tiktoken_encoder(tiktoken_model)
+        tokens = encoder.encode(text)
+        # 将 token ID 转回文本片段
+        token_texts = [encoder.decode([t]) for t in tokens]
+        # 对每个片段再用 jieba 分词
+        final_words = []
+        for token_text in token_texts:
+            words = list(jieba.cut(token_text))
+            final_words.extend(words)
+        return ' '.join(final_words)
+    
+    elif use_tiktoken:
+        # 仅 tiktoken
+        encoder = get_tiktoken_encoder(tiktoken_model)
+        tokens = encoder.encode(text)
+        # 将 token ID 转为字符串（保留 ID 作为特征）
+        return ' '.join([f"tk{t}" for t in tokens])
+    
+    elif use_jieba:
+        # 仅 jieba
+        words = jieba.cut(text)
+        return ' '.join(words)
+    
+    else:
+        # 不应该到这里，但作为后备返回原文
+        return text
 
 
 # 模型缓存：{profile_name: (model, model_mtime)}
@@ -105,7 +165,7 @@ def train_fasttext_model_jieba(profile: ModerationProfile):
 
 def _prepare_training_file_jieba(samples, profile: ModerationProfile) -> str:
     """
-    准备 fastText 训练文件（使用 jieba 分词）
+    准备 fastText 训练文件（使用高级分词）
     
     格式: __label__0 词1 词2 词3 ...
           __label__1 词1 词2 词3 ...
@@ -113,25 +173,39 @@ def _prepare_training_file_jieba(samples, profile: ModerationProfile) -> str:
     Returns:
         训练文件路径
     """
-    # 创建临时文件
-    fd, train_file = tempfile.mkstemp(suffix=".txt", prefix="fasttext_jieba_train_")
+    cfg = profile.config.fasttext_training
+    use_jieba = cfg.use_jieba
+    use_tiktoken = cfg.use_tiktoken
+    tiktoken_model = cfg.tiktoken_model
     
-    print(f"[FastText-Jieba] 开始 jieba 分词...")
+    # 创建临时文件
+    fd, train_file = tempfile.mkstemp(suffix=".txt", prefix="fasttext_advanced_train_")
+    
+    # 确定分词模式描述
+    if use_tiktoken and use_jieba:
+        mode_desc = "tiktoken + jieba 组合分词"
+    elif use_tiktoken:
+        mode_desc = f"tiktoken 分词 (模型: {tiktoken_model})"
+    elif use_jieba:
+        mode_desc = "jieba 分词"
+    else:
+        mode_desc = "无分词（不应该到这里）"
+    
+    print(f"[FastText-Advanced] 开始分词: {mode_desc}")
     with os.fdopen(fd, 'w', encoding='utf-8') as f:
         # 使用 tqdm 显示分词进度
-        for sample in tqdm(samples, desc="jieba 分词", unit="样本"):
+        for sample in tqdm(samples, desc=mode_desc, unit="样本"):
             # 预处理文本
             text = sample.text.replace('\n', ' ').replace('\r', ' ')
             
-            # jieba 分词
-            words = jieba.cut(text)
-            segmented_text = ' '.join(words)
+            # 根据配置进行分词
+            segmented_text = tokenize_text(text, use_jieba, use_tiktoken, tiktoken_model)
             
             # fastText 格式: __label__<类别> <分词后的文本>
             label = sample.label  # 0 或 1
             f.write(f"__label__{label} {segmented_text}\n")
     
-    print(f"[FastText-Jieba] 训练文件已生成: {train_file}")
+    print(f"[FastText-Advanced] 训练文件已生成: {train_file}")
     return train_file
 
 
@@ -174,7 +248,7 @@ def _load_fasttext_with_cache(profile: ModerationProfile) -> fasttext.FastText:
 
 def fasttext_predict_proba_jieba(text: str, profile: ModerationProfile) -> float:
     """
-    使用 fastText 模型预测违规概率（jieba 分词版本）
+    使用 fastText 模型预测违规概率（高级分词版本）
     
     Args:
         text: 待预测文本
@@ -183,7 +257,22 @@ def fasttext_predict_proba_jieba(text: str, profile: ModerationProfile) -> float
     Returns:
         违规概率 (0-1)
     """
-    print(f"[DEBUG] fastText-Jieba 模型预测")
+    cfg = profile.config.fasttext_training
+    use_jieba = cfg.use_jieba
+    use_tiktoken = cfg.use_tiktoken
+    tiktoken_model = cfg.tiktoken_model
+    
+    # 确定分词模式
+    if use_tiktoken and use_jieba:
+        mode_desc = "tiktoken+jieba"
+    elif use_tiktoken:
+        mode_desc = "tiktoken"
+    elif use_jieba:
+        mode_desc = "jieba"
+    else:
+        mode_desc = "unknown"
+    
+    print(f"[DEBUG] fastText-Advanced 模型预测 (分词: {mode_desc})")
     
     # 加载模型（带缓存）
     model = _load_fasttext_with_cache(profile)
@@ -191,9 +280,8 @@ def fasttext_predict_proba_jieba(text: str, profile: ModerationProfile) -> float
     # 预处理文本
     text = text.replace('\n', ' ').replace('\r', ' ')
     
-    # jieba 分词
-    words = jieba.cut(text)
-    segmented_text = ' '.join(words)
+    # 根据配置进行分词
+    segmented_text = tokenize_text(text, use_jieba, use_tiktoken, tiktoken_model)
     
     # 预测（返回 top-k 标签和概率）
     labels, probs = model.predict(segmented_text, k=2)

@@ -42,7 +42,7 @@ def get_all_profiles() -> List[str]:
 def train_local_model(profile: ModerationProfile):
     """
     训练本地模型（根据配置类型）
-    对于 fastText，根据 use_jieba 配置选择训练方式
+    对于 fastText，根据 use_jieba/use_tiktoken 配置选择训练方式
     
     Args:
         profile: 配置对象
@@ -50,9 +50,12 @@ def train_local_model(profile: ModerationProfile):
     model_type = profile.config.local_model_type
     
     if model_type == LocalModelType.fasttext:
-        # 根据 use_jieba 配置选择对应的训练函数
+        # 根据分词配置选择对应的训练函数
         use_jieba = profile.config.fasttext_training.use_jieba
-        if use_jieba:
+        use_tiktoken = profile.config.fasttext_training.use_tiktoken
+        
+        # 如果启用了任何高级分词（jieba 或 tiktoken），使用高级版本
+        if use_jieba or use_tiktoken:
             from ai_proxy.moderation.smart.fasttext_model_jieba import train_fasttext_model_jieba
             train_fasttext_model_jieba(profile)
         else:
