@@ -233,7 +233,7 @@ async def proxy_entry(cfg_and_upstream: str, request: Request):
     URL 格式: /{url_encoded_config}${upstream_with_path}
     例如: /%7B...%7D$http://api.com/v1/chat/completions
     """
-    # 解析配置，upstream_base 包含完整的上游 URL（含路径）
+    # 解析配置，upstream_full 包含完整的上游 URL（含路径）
     try:
         config, upstream_full = parse_url_config(cfg_and_upstream)
 
@@ -291,8 +291,34 @@ async def proxy_entry(cfg_and_upstream: str, request: Request):
     # passed=True 时，data 是 (转换后的body, 转换后的path) 元组
     transformed_body, transformed_path = data if isinstance(data, tuple) else (data, None)
     
-    # 如果有转换后的路径，使用它；否则使用原始路径
-    final_path = transformed_path if transformed_path is not None else path
+    # 如果有转换后的路径，需要智能处理路径拼接
+    # 场景1：upstream_path="/secret_endpoint/v1/messages", transformed_path="/v1/chat/completions"
+    #        应该替换格式相关部分，保留前缀："/secret_endpoint/v1/chat/completions"
+    # 场景2：upstream_path="/", transformed_path="/v1/chat/completions"
+    #        直接使用转换后的路径："/v1/chat/completions"
+    if transformed_path is not None:
+        # 尝试找到格式相关的路径部分（如 /v1/messages, /v1/chat/completions 等）
+        # 常见的API路径模式：/v1/xxx, /v1beta/xxx
+        import re
+        
+        # 匹配常见的API端点模式
+        api_pattern = r'/(v\d+(?:beta)?/[^/]+(?:/[^/]+)*)'
+        
+        # 在原始路径中查找API端点
+        match = re.search(api_pattern, path)
+        
+        if match:
+            # 找到了API端点，提取前缀部分
+            api_start = match.start()
+            prefix = path[:api_start] if api_start > 0 else ""
+            
+            # 拼接：前缀 + 转换后的路径
+            final_path = prefix + transformed_path
+        else:
+            # 没有找到明显的API端点模式，直接使用转换后的路径
+            final_path = transformed_path
+    else:
+        final_path = path
 
     # 转发到上游
     upstream_client = UpstreamClient(upstream_base)
@@ -324,14 +350,18 @@ async def proxy_entry(cfg_and_upstream: str, request: Request):
             is_stream_request = body.get("stream", False)
             print(f"[ROUTER] Non-Gemini format: checking body.stream={is_stream_request}")
     
+    # ✅ 修复：即使不需要格式转换，delay_stream_header 也需要知道正确的格式
+    # 否则 StreamChecker 会默认使用 openai_chat 格式，导致无法正确解析 Gemini 的 JSON 数组流
+    actual_target_format = target_format_cfg or src_format if delay_stream_header else target_format_cfg if need_response_transform else None
+    
     print(f"[ROUTER] Format info: src_format={src_format}, target_format_cfg={target_format_cfg}")
     print(f"[ROUTER] need_response_transform={need_response_transform}, delay_stream_header={delay_stream_header}")
     print(f"[ROUTER] is_stream_request={is_stream_request}")
-    print(f"[ROUTER] Will pass target_format={(target_format_cfg if (need_response_transform or delay_stream_header) else None)}")
+    print(f"[ROUTER] Will pass target_format={actual_target_format}")
     
     # 转发请求
     # 注意：即使不需要响应转换，如果启用了 delay_stream_header，
-    # 也需要传递格式信息用于内容检查
+    # 也需要传递格式信息用于内容检查（使用 src_format 作为后备）
     try:
         response = await upstream_client.forward_request(
             method=request.method,
@@ -340,7 +370,7 @@ async def proxy_entry(cfg_and_upstream: str, request: Request):
             body=transformed_body if transformed_body else body,
             is_stream=is_stream_request,
             src_format=src_format if need_response_transform else None,
-            target_format=target_format_cfg if (need_response_transform or delay_stream_header) else None,
+            target_format=actual_target_format,
             delay_stream_header=delay_stream_header
         )
         return response
